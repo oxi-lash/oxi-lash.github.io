@@ -1,0 +1,1452 @@
+# Сайт онлайн-записи к lash-мастеру: GitHub Pages + Supabase (всё бесплатно)
+
+**Что получится:** нежный mobile-first сайт `https://USERNAME.github.io/lash-booking/` с записью в 3 тапа, админка `…/#/admin` (вход по пин-коду), уведомление мастеру в личку ВК при каждой новой записи.
+
+**Ключевые инженерные решения (важно понять до кода):**
+- **Роутинг через `#`**: GitHub Pages — тупой статический хостинг, он не умеет отдавать `index.html` на путь `/admin`. Поэтому админка живёт по адресу `/#/admin` — это работает всегда, без 404-хаков.
+- **Пин-код = пароль единственного пользователя Supabase Auth.** Роль `authenticated` получает права админа через RLS. Регистрацию новых пользователей обязательно отключаем (шаг 2).
+- **Запись — через RPC-функцию `book_slot`** (SECURITY DEFINER): слот бронируется атомарно, два клиента не займут одно окошко. Анонимный ключ публичный, поэтому вся защита — в RLS: таблицу `bookings` клиенты не читают вообще.
+- Стек: Vite + React 19 + Tailwind v4 (плагин `@tailwindcss/vite`, без конфигов) [[20]] + `@supabase/supabase-js`. Уведомление — Edge Function + Database Webhook [[11]].
+
+---
+
+## Структура проекта
+
+Каждый файл — маленький и независимый (≤ ~150 строк), чтобы скармливать локальной нейросети 2–4 файла за раз.
+
+```
+lash-booking/
+├── .github/workflows/
+│   ├── deploy.yml              # сборка и публикация на GitHub Pages
+│   └── keepalive.yml           # пинг Supabase, чтобы free-проект не засыпал
+├── .env.example
+├── .gitignore
+├── index.html
+├── package.json
+├── vite.config.js
+├── README.md
+├── supabase/
+│   ├── schema.sql              # таблицы, RLS, RPC, демо-данные
+│   └── functions/notify-vk/
+│       └── index.ts            # уведомление в ВК
+└── src/
+    ├── main.jsx
+    ├── App.jsx                 # мини-роутер по hash
+    ├── index.css
+    ├── config.js               # ⚙️ ВСЕ настройки мастера — здесь
+    ├── lib/
+    │   ├── supabase.js
+    │   ├── format.js           # даты, рубли, телефон
+    │   └── api.js              # все запросы к Supabase
+    ├── components/
+    │   ├── ui.jsx              # кнопки, карточки, поля
+    │   ├── Header.jsx
+    │   ├── ServicePicker.jsx
+    │   ├── Calendar.jsx
+    │   ├── SlotPicker.jsx
+    │   ├── BookingForm.jsx
+    │   └── Success.jsx
+    └── pages/
+        ├── ClientPage.jsx
+        └── admin/
+            ├── AdminPage.jsx
+            ├── Login.jsx
+            ├── BookingsTab.jsx
+            ├── SlotsTab.jsx
+            └── ServicesTab.jsx
+```
+
+---
+
+## Шаг 1. Supabase: проект и база
+
+1. [supabase.com](https://supabase.com) → **New project** (Free plan, регион EU Frankfurt — ближе к РФ). Дождитесь создания.
+2. **SQL Editor → New query** → вставьте скрипт ниже целиком → **Run**.
+
+**`supabase/schema.sql`**
+
+```sql
+-- ============================================================
+-- Lash Booking: схема Supabase. Выполнить в SQL Editor целиком.
+-- ============================================================
+
+-- 1) Услуги
+create table if not exists public.services (
+  id           uuid primary key default gen_random_uuid(),
+  title        text not null check (char_length(title) between 1 and 100),
+  price_rub    integer not null check (price_rub >= 0),
+  duration_min integer not null check (duration_min > 0),
+  sort         integer not null default 0,
+  is_active    boolean not null default true,
+  created_at   timestamptz not null default now()
+);
+
+-- 2) Окошки: строка = один час конкретного дня
+create table if not exists public.slots (
+  id         uuid primary key default gen_random_uuid(),
+  day        date not null,
+  hour       smallint not null check (hour between 0 and 23),
+  status     text not null default 'free' check (status in ('free','booked')),
+  created_at timestamptz not null default now(),
+  unique (day, hour)
+);
+create index if not exists slots_day_idx on public.slots (day);
+
+-- 3) Записи. Цена/название услуги «сфотографированы» в момент записи,
+--    чтобы изменение прайса не ломало историю.
+create table if not exists public.bookings (
+  id            uuid primary key default gen_random_uuid(),
+  slot_id       uuid not null references public.slots (id),
+  service_id    uuid references public.services (id),
+  client_name   text not null,
+  phone         text not null,
+  vk_link       text not null default '',
+  service_title text not null,
+  price_rub     integer not null,
+  duration_min  integer not null,
+  status        text not null default 'active' check (status in ('active','cancelled')),
+  created_at    timestamptz not null default now()
+);
+create unique index if not exists one_active_booking_per_slot
+  on public.bookings (slot_id) where status = 'active';
+
+-- 4) RLS — вся безопасность здесь (anon-ключ публичный!)
+alter table public.services enable row level security;
+alter table public.slots    enable row level security;
+alter table public.bookings enable row level security;
+
+create policy services_read_active on public.services
+  for select to anon using (is_active);
+create policy services_admin_all on public.services
+  for all to authenticated using (true) with check (true);
+
+create policy slots_read_all on public.slots
+  for select to anon using (true);          -- в слотах нет персональных данных
+create policy slots_admin_all on public.slots
+  for all to authenticated using (true) with check (true);
+
+-- bookings: у anon НЕТ политик => ни чтения, ни записи напрямую.
+create policy bookings_admin_all on public.bookings
+  for all to authenticated using (true) with check (true);
+
+-- 5) Атомарная запись клиента (вызывается без логина)
+create or replace function public.book_slot(
+  p_slot_id uuid, p_service_id uuid,
+  p_name text, p_phone text, p_vk text default ''
+) returns json
+language plpgsql
+security definer set search_path = public
+as $$
+declare
+  v_slot    public.slots%rowtype;
+  v_service public.services%rowtype;
+  v_booking public.bookings%rowtype;
+begin
+  if char_length(trim(coalesce(p_name,''))) < 2 then
+    raise exception 'NAME_REQUIRED';
+  end if;
+  if char_length(regexp_replace(coalesce(p_phone,''), '\D', '', 'g')) < 10 then
+    raise exception 'PHONE_REQUIRED';
+  end if;
+
+  -- UPDATE ... WHERE status='free' — атомарная защита от двойной брони
+  update public.slots set status = 'booked'
+   where id = p_slot_id and status = 'free'
+  returning * into v_slot;
+  if not found then
+    raise exception 'SLOT_TAKEN';
+  end if;
+
+  select * into v_service from public.services
+   where id = p_service_id and is_active;
+  if not found then
+    update public.slots set status = 'free' where id = p_slot_id;
+    raise exception 'SERVICE_NOT_FOUND';
+  end if;
+
+  insert into public.bookings
+    (slot_id, service_id, client_name, phone, vk_link,
+     service_title, price_rub, duration_min)
+  values
+    (v_slot.id, v_service.id, left(trim(p_name),100), left(trim(p_phone),30),
+     left(trim(coalesce(p_vk,'')),200),
+     v_service.title, v_service.price_rub, v_service.duration_min)
+  returning * into v_booking;
+
+  return json_build_object(
+    'booking_id', v_booking.id,
+    'day', v_slot.day, 'hour', v_slot.hour,
+    'service_title', v_service.title,
+    'price_rub', v_service.price_rub,
+    'duration_min', v_service.duration_min,
+    'client_name', v_booking.client_name,
+    'phone', v_booking.phone
+  );
+end;
+$$;
+
+revoke execute on function public.book_slot(uuid,uuid,text,text,text) from public;
+grant  execute on function public.book_slot(uuid,uuid,text,text,text) to anon, authenticated;
+
+-- 6) Отмена записи мастером: запись → cancelled, окошко → free
+create or replace function public.admin_cancel_booking(p_booking_id uuid)
+returns void
+language plpgsql
+security definer set search_path = public
+as $$
+declare v_slot_id uuid;
+begin
+  update public.bookings set status = 'cancelled'
+   where id = p_booking_id and status = 'active'
+  returning slot_id into v_slot_id;
+  if not found then
+    raise exception 'BOOKING_NOT_FOUND';
+  end if;
+  update public.slots set status = 'free' where id = v_slot_id;
+end;
+$$;
+
+revoke execute on function public.admin_cancel_booking(uuid) from public, anon;
+grant  execute on function public.admin_cancel_booking(uuid) to authenticated;
+
+-- 7) Демо-данные (отредактируйте под себя)
+insert into public.services (title, price_rub, duration_min, sort) values
+  ('Классическое наращивание', 2500, 120, 1),
+  ('Объём 2D',                 3000, 150, 2),
+  ('Объём 3D',                 3500, 180, 3),
+  ('Снятие ресниц',             500,  30, 4);
+
+insert into public.slots (day, hour)
+select current_date + 1, h from generate_series(10, 19) as h
+on conflict (day, hour) do nothing;
+```
+
+## Шаг 2. Пин-код мастера (Supabase Auth)
+
+1. **Authentication → Sign In / Providers → Email**: провайдер включён, а **«Allow new users to sign up» — ВЫКЛЮЧИТЬ**. Это критично: любой зарегистрировавшийся получил бы роль `authenticated` и доступ к записям.
+2. **Authentication → Users → Add user → Create new user**:
+   - Email: `admin@lash.local` (должен совпадать с `ADMIN_EMAIL` в `src/config.js`);
+   - Password: ваш пин-код, **минимум 6 цифр** (это и есть пин для входа);
+   - Галочка **Auto Confirm User** — обязательно.
+3. Сменить пин-код потом: тот же пользователь → Update password.
+
+## Шаг 3. ВКонтакте: сообщество и ключ
+
+1. В сообществе: **Управление → Сообщения → Сообщения сообщества: Включены**.
+2. **Управление → Работа с API → Ключи доступа → Создать ключ** → право **«Сообщения сообщества»** (`messages`). Скопируйте токен — он показывается один раз.
+3. **Мастер со своей личной страницы пишет сообществу любое сообщение** («привет»). Без этого VK вернёт ошибку `901 Can't send messages for users without permission` — сообщество не может написать первым [[6]].
+4. Адресат сообщения — сам мастер. Задаётся либо коротким адресом страницы (`VK_DOMAIN`, например `alina_lash`), либо числовым id (`VK_PEER_ID`). Id удобно подсмотреть в URL диалога в сообщениях сообщества: `vk.com/gim…?sel=12345678` — `sel` и есть id.
+5. Ссылка «написать мастеру» для клиентов: `https://vk.me/КОРОТКИЙ_АДРЕС` (страницы или сообщества) — её впишем в `config.js`.
+
+## Шаг 4. Edge Function + Database Webhook (уведомления)
+
+**`supabase/functions/notify-vk/index.ts`**
+
+```ts
+// Supabase Edge Function (Deno). Вызывается Database Webhook'ом
+// при INSERT в public.bookings и шлёт мастеру сообщение от имени сообщества.
+// Secrets: VK_TOKEN, VK_DOMAIN (или VK_PEER_ID), WEBHOOK_SECRET, ADMIN_URL (опц.)
+import { createClient } from 'npm:@supabase/supabase-js@2'
+
+const MONTHS = ['января','февраля','марта','апреля','мая','июня',
+                'июля','августа','сентября','октября','ноября','декабря']
+
+Deno.serve(async (req) => {
+  // Простая защита: вебхук обязан прислать заголовок x-webhook-secret
+  const secret = Deno.env.get('WEBHOOK_SECRET')
+  if (secret && req.headers.get('x-webhook-secret') !== secret) {
+    return new Response('forbidden', { status: 401 })
+  }
+
+  let payload: { type?: string; table?: string; record?: Record<string, unknown> }
+  try { payload = await req.json() } catch { return new Response('bad json', { status: 400 }) }
+  if (payload.type !== 'INSERT' || payload.table !== 'bookings' || !payload.record) {
+    return Response.json({ skipped: true })
+  }
+  const b = payload.record as Record<string, string>
+
+  // Дату/время слота достаём service-ключом (он живёт только здесь, не в браузере)
+  const db = createClient(Deno.env.get('SUPABASE_URL')!, Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!)
+  const { data: slot } = await db.from('slots').select('day,hour').eq('id', b.slot_id).single()
+
+  let when = 'дата уточняется'
+  if (slot) {
+    const [y, m, d] = String(slot.day).split('-').map(Number)
+    when = `${d} ${MONTHS[m - 1]} ${y}, ${String(slot.hour).padStart(2, '0')}:00`
+  }
+
+  const message = [
+    '💖 Новая запись!', '',
+    `👤 ${b.client_name}`,
+    `📞 ${b.phone}`,
+    b.vk_link ? `🔗 ${b.vk_link}` : null,
+    `💅 ${b.service_title} — ${b.price_rub} ₽ (${b.duration_min} мин)`,
+    `📅 ${when}`,
+    Deno.env.get('ADMIN_URL') ? `\nПанель: ${Deno.env.get('ADMIN_URL')}` : null,
+  ].filter(Boolean).join('\n')
+
+  // random_id обязан помещаться в int32 (требование VK API)
+  const params = new URLSearchParams({
+    access_token: Deno.env.get('VK_TOKEN')!,
+    v: '5.199',
+    random_id: String(Date.now() % 2147483647),
+    message,
+  })
+  const peerId = Deno.env.get('VK_PEER_ID')
+  if (peerId) params.set('peer_id', peerId)
+  else params.set('domain', Deno.env.get('VK_DOMAIN') ?? '')
+
+  const res = await fetch('https://api.vk.com/method/messages.send', { method: 'POST', body: params })
+  const json = await res.json()
+  if (json.error) {
+    console.error('VK error:', json.error) // 901 = мастер не разрешил сообщения сообществу
+    return Response.json({ ok: false, vk_error: json.error })
+  }
+  return Response.json({ ok: true, message_id: json.response })
+})
+```
+
+Параметры `messages.send` (ключ сообщества с правом `messages`, `peer_id`/`domain`, обязательный `random_id`) — по официальной документации метода [[6]].
+
+**Деплой (без CLI, через дашборд):**
+1. **Edge Functions → Deploy new function → Via Editor** → имя `notify-vk` → вставьте код → в настройках функции **выключите «Verify JWT»** → Deploy.
+2. **Edge Functions → Secrets** добавьте: `VK_TOKEN`, `VK_DOMAIN` (или `VK_PEER_ID`), `WEBHOOK_SECRET` (придумайте длинную строку), `ADMIN_URL` = `https://USERNAME.github.io/lash-booking/#/admin`. (`SUPABASE_URL` и `SUPABASE_SERVICE_ROLE_KEY` подставляются автоматически.)
+
+Альтернатива через CLI: `npx supabase login` → `npx supabase link --project-ref ВАШ_REF` → `npx supabase secrets set VK_TOKEN=… VK_DOMAIN=… WEBHOOK_SECRET=…` → `npx supabase functions deploy notify-vk --no-verify-jwt`.
+
+**Вебхук:**
+1. **Database → Webhooks** (в новом интерфейсе — **Integrations → Webhooks**) → **Create a new hook**.
+2. Name: `notify-vk-on-booking`; Table: `public.bookings`; Events: только **Insert**; Type: **Supabase Edge Functions** → `notify-vk`; Method: POST.
+3. **HTTP Headers**: добавьте `x-webhook-secret` = значение вашего `WEBHOOK_SECRET`. Сохраните.
+
+Вебхук пришлёт функции JSON вида `{ type: 'INSERT', table: 'bookings', record: {…} }` — именно его функция и разбирает [[11]].
+
+---
+
+## Шаг 5. Фронтенд: полный код всех файлов
+
+**`package.json`**
+
+```json
+{
+  "name": "lash-booking",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": { "dev": "vite", "build": "vite build", "preview": "vite preview" },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.0",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.1.0",
+    "@vitejs/plugin-react": "^4.4.0",
+    "tailwindcss": "^4.1.0",
+    "vite": "^6.3.0"
+  }
+}
+```
+
+**`vite.config.js`**
+
+```js
+import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
+import tailwindcss from '@tailwindcss/vite'
+
+// base './' — чтобы сайт работал в подпапке USERNAME.github.io/lash-booking/
+export default defineConfig({ base: './', plugins: [react(), tailwindcss()] })
+```
+
+**`index.html`**
+
+```html
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#FFF9F5" />
+    <title>Алина Иванова — запись на ресницы</title>
+    <meta name="description" content="Онлайн-запись к lash-мастеру: услуга, день и время в три тапа." />
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🌸</text></svg>" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Playfair+Display:ital,wght@0,500;0,600;1,500&display=swap" rel="stylesheet" />
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
+```
+
+**`.env.example`**
+
+```bash
+# Supabase → Project Settings → API: Project URL и anon/public key
+VITE_SUPABASE_URL=https://ВАШ-ПРОЕКТ.supabase.co
+VITE_SUPABASE_ANON_KEY=eyJhbGciOi...ваш_anon_ключ
+```
+
+**`.gitignore`**
+
+```
+node_modules
+dist
+.env
+.env.local
+*.local
+```
+
+**`src/index.css`**
+
+```css
+@import "tailwindcss";
+
+@theme {
+  --color-cream: #fff9f5;
+  --font-sans: "Manrope", ui-sans-serif, system-ui, sans-serif;
+  --font-display: "Playfair Display", Georgia, serif;
+}
+
+html { -webkit-tap-highlight-color: transparent; }
+body {
+  background-color: var(--color-cream);
+  color: #292524;
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+::selection { background: #fbcfe8; }
+```
+
+**`src/config.js`** — единственный файл, который мастер правит «под себя».
+
+```js
+// ⚙️ Все настройки мастера — здесь.
+export const MASTER = {
+  name: 'Алина Иванова',
+  tagline: 'Lash-мастер · Москва',
+  photoUrl: '', // положите фото в public/master.jpg и укажите 'master.jpg'
+  vkWrite: 'https://vk.me/lash_alina',   // «написать сообщение» (страница или сообщество)
+  vkProfile: 'https://vk.com/lash_alina',
+  address: 'м. Чистые пруды, Москва',
+}
+export const TIMEZONE = 'Europe/Moscow'
+export const WORK_HOURS = [10, 11, 12, 13, 14, 15, 16, 17, 18, 19] // сетка часов в админке
+export const BOOKING_DAYS_AHEAD = 45 // на сколько дней вперёд открыта запись
+export const ADMIN_EMAIL = 'admin@lash.local' // email админ-пользователя Auth (пароль = пин)
+```
+
+**`src/lib/supabase.js`**
+
+```js
+import { createClient } from '@supabase/supabase-js'
+
+const url = import.meta.env.VITE_SUPABASE_URL
+const key = import.meta.env.VITE_SUPABASE_ANON_KEY
+
+export const supabase = url && key ? createClient(url, key) : null
+export const isConfigured = Boolean(supabase)
+```
+
+**`src/lib/format.js`**
+
+```js
+// Даты, рубли, телефон. Чистые функции, без React.
+import { TIMEZONE } from '../config'
+
+export const MONTHS = ['Январь','Февраль','Март','Апрель','Май','Июнь','Июль','Август','Сентябрь','Октябрь','Ноябрь','Декабрь']
+export const WEEKDAYS = ['Пн','Вт','Ср','Чт','Пт','Сб','Вс']
+
+export const pad = (n) => String(n).padStart(2, '0')
+export const dayStr = (y, m, d) => `${y}-${pad(m + 1)}-${pad(d)}` // m: 0–11
+
+const tzParts = () => {
+  const parts = new Intl.DateTimeFormat('ru-RU', {
+    timeZone: TIMEZONE, year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', hourCycle: 'h23',
+  }).formatToParts(new Date())
+  const get = (t) => Number(parts.find((p) => p.type === t).value)
+  return { y: get('year'), m: get('month') - 1, d: get('day'), h: get('hour') }
+}
+export const todayStr = () => { const { y, m, d } = tzParts(); return dayStr(y, m, d) }
+export const nowHour = () => tzParts().h
+
+export const parseDay = (s) => { const [y, m, d] = s.split('-').map(Number); return new Date(y, m - 1, d) }
+export const shiftDay = (s, n) => { const t = parseDay(s); t.setDate(t.getDate() + n); return dayStr(t.getFullYear(), t.getMonth(), t.getDate()) }
+export const monthRange = (month) => {
+  const y = month.getFullYear(), m = month.getMonth()
+  return { from: dayStr(y, m, 1), to: dayStr(y, m, new Date(y, m + 1, 0).getDate()) }
+}
+export const fmtDay = (s) =>
+  new Intl.DateTimeFormat('ru-RU', { weekday: 'short', day: 'numeric', month: 'long' }).format(parseDay(s))
+export const hourLabel = (h) => `${pad(h)}:00`
+export const rub = (n) => `${new Intl.NumberFormat('ru-RU').format(n)} ₽`
+export const duration = (min) =>
+  min < 60 ? `${min} мин` : `${Math.floor(min / 60)} ч${min % 60 ? ` ${min % 60} мин` : ''}`
+
+export const phoneDigits = (v) => v.replace(/\D/g, '')
+export const fmtPhoneInput = (value) => {
+  let d = phoneDigits(value)
+  if (!d) return ''
+  if (d[0] === '8') d = '7' + d.slice(1)
+  if (d[0] !== '7') d = '7' + d
+  d = d.slice(0, 11)
+  let out = '+7'
+  if (d.length > 1) out += ` (${d.slice(1, 4)}`
+  if (d.length > 4) out += `) ${d.slice(4, 7)}`
+  if (d.length > 7) out += `-${d.slice(7, 9)}`
+  if (d.length > 9) out += `-${d.slice(9, 11)}`
+  return out
+}
+export const vkHref = (link) => (/^https?:\/\//i.test(link) ? link : `https://${link}`)
+```
+
+**`src/lib/api.js`**
+
+```js
+// Все обращения к Supabase — только здесь.
+import { supabase } from './supabase'
+
+const db = () => {
+  if (!supabase) throw new Error('Supabase не настроен: заполните ключи (.env / секреты GitHub)')
+  return supabase
+}
+const unwrap = ({ data, error }) => { if (error) throw error; return data }
+
+// ---------- клиент ----------
+export const listServices = async () =>
+  unwrap(await db().from('services').select('*').order('sort').order('created_at'))
+
+export const listSlotsRange = async (from, to) =>
+  unwrap(await db().from('slots').select('id,day,hour,status')
+    .gte('day', from).lte('day', to).order('day').order('hour'))
+
+export const bookSlot = async ({ slotId, serviceId, name, phone, vk }) =>
+  unwrap(await db().rpc('book_slot', {
+    p_slot_id: slotId, p_service_id: serviceId,
+    p_name: name, p_phone: phone, p_vk: vk || '',
+  }))
+
+// ---------- админ ----------
+export const signInAdmin = async (email, pin) =>
+  unwrap(await db().auth.signInWithPassword({ email, password: pin }))
+export const signOutAdmin = async () => { await db().auth.signOut() }
+
+export const listBookings = async () =>
+  unwrap(await db().from('bookings').select('*, slots(day,hour)')
+    .eq('status', 'active').order('created_at', { ascending: false }))
+
+export const cancelBooking = async (id) =>
+  unwrap(await db().rpc('admin_cancel_booking', { p_booking_id: id }))
+
+export const addSlot = async (day, hour) => {
+  const { error } = await db().from('slots').insert({ day, hour })
+  if (error && error.code !== '23505') throw error // 23505 = уже существует, не страшно
+}
+export const removeSlot = async (id) =>
+  unwrap(await db().from('slots').delete().eq('id', id).eq('status', 'free'))
+
+export const saveService = async (s) => {
+  const row = {
+    title: s.title.trim(),
+    price_rub: Number(s.price_rub),
+    duration_min: Number(s.duration_min),
+    is_active: Boolean(s.is_active),
+    sort: Number(s.sort || 0),
+  }
+  if (s.id) row.id = s.id
+  return unwrap(await db().from('services').upsert(row).select().single())
+}
+
+// ---------- человеческие ошибки ----------
+export const humanError = (e) => {
+  const m = e?.message || String(e)
+  if (m.includes('SLOT_TAKEN')) return 'Это окошко только что заняли 😔 Выберите другое время.'
+  if (m.includes('NAME_REQUIRED')) return 'Укажите имя.'
+  if (m.includes('PHONE_REQUIRED')) return 'Проверьте номер телефона.'
+  if (m.includes('SERVICE_NOT_FOUND')) return 'Услуга недоступна, обновите страницу.'
+  if (m.includes('Invalid login')) return 'Неверный пин-код.'
+  if (m.includes('Failed to fetch')) return 'Нет связи с сервером. Проверьте интернет.'
+  return 'Что-то пошло не так. Попробуйте ещё раз.'
+}
+```
+
+**`src/main.jsx`**
+
+```jsx
+import { StrictMode } from 'react'
+import { createRoot } from 'react-dom/client'
+import App from './App'
+import './index.css'
+
+createRoot(document.getElementById('root')).render(
+  <StrictMode><App /></StrictMode>
+)
+```
+
+**`src/App.jsx`**
+
+```jsx
+// Мини-роутер на hash: '/' — клиенты, '#/admin' — мастер.
+// Hash нужен, потому что GitHub Pages не поддерживает серверные роуты.
+import { useEffect, useState } from 'react'
+import ClientPage from './pages/ClientPage'
+import AdminPage from './pages/admin/AdminPage'
+
+export default function App() {
+  const [hash, setHash] = useState(window.location.hash)
+  useEffect(() => {
+    const onHash = () => { setHash(window.location.hash); window.scrollTo(0, 0) }
+    window.addEventListener('hashchange', onHash)
+    return () => window.removeEventListener('hashchange', onHash)
+  }, [])
+  return hash.startsWith('#/admin') ? <AdminPage /> : <ClientPage />
+}
+```
+
+**`src/components/ui.jsx`**
+
+```jsx
+// Мелкие общие UI-компоненты. Без бизнес-логики.
+export function Btn({ variant = 'primary', className = '', ...props }) {
+  const styles = {
+    primary: 'bg-rose-400 text-white shadow-lg shadow-rose-200 hover:bg-rose-500',
+    soft: 'bg-rose-100 text-rose-600 hover:bg-rose-200',
+    ghost: 'border border-stone-200 bg-white text-stone-600 hover:border-rose-300',
+    danger: 'border border-red-200 bg-white text-red-500 hover:bg-red-50',
+  }
+  return (
+    <button
+      className={`rounded-2xl px-5 py-3.5 text-base font-bold transition active:scale-[.97] disabled:pointer-events-none disabled:opacity-50 ${styles[variant]} ${className}`}
+      {...props}
+    />
+  )
+}
+
+export const Card = ({ className = '', ...props }) => (
+  <div className={`rounded-3xl border border-rose-100 bg-white p-5 shadow-sm shadow-rose-100 ${className}`} {...props} />
+)
+
+export const Spinner = () => (
+  <svg className="h-6 w-6 animate-spin" viewBox="0 0 24 24" fill="none">
+    <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" className="opacity-25" />
+    <path d="M4 12a8 8 0 0 1 8-8" stroke="currentColor" strokeWidth="4" strokeLinecap="round" />
+  </svg>
+)
+
+export const Field = ({ label, hint, className = '', ...props }) => (
+  <label className="block">
+    <span className="mb-1.5 block text-sm font-semibold text-stone-600">
+      {label}{hint && <span className="font-normal text-stone-400"> {hint}</span>}
+    </span>
+    <input
+      className={`w-full rounded-2xl border border-rose-200 bg-white px-4 py-3.5 text-base text-stone-800 outline-none focus:border-rose-400 focus:ring-4 focus:ring-rose-100 ${className}`}
+      {...props}
+    />
+  </label>
+)
+
+export const SectionTitle = ({ step, children }) => (
+  <h2 className="mb-3 flex items-center gap-2.5 font-display text-xl text-stone-800">
+    {step && <span className="grid h-7 w-7 place-items-center rounded-full bg-rose-400 font-sans text-sm font-bold text-white">{step}</span>}
+    {children}
+  </h2>
+)
+
+export const Empty = ({ children }) => (
+  <div className="py-10 text-center leading-relaxed text-stone-400">{children}</div>
+)
+
+export const Err = ({ children }) =>
+  children ? <div className="rounded-2xl border border-red-100 bg-red-50 px-4 py-3 text-sm text-red-600">{children}</div> : null
+```
+
+**`src/components/Header.jsx`**
+
+```jsx
+import { MASTER } from '../config'
+
+export default function Header() {
+  return (
+    <header className="pb-6 pt-8 text-center">
+      <div className="mx-auto mb-4 grid h-28 w-28 place-items-center overflow-hidden rounded-full bg-gradient-to-br from-rose-200 to-rose-300 shadow-lg shadow-rose-200 ring-4 ring-white">
+        {MASTER.photoUrl
+          ? <img src={MASTER.photoUrl} alt={MASTER.name} className="h-full w-full object-cover" />
+          : <span className="text-4xl">🌸</span>}
+      </div>
+      <h1 className="font-display text-3xl text-stone-800">{MASTER.name}</h1>
+      <p className="mt-1 text-sm text-stone-500">{MASTER.tagline}</p>
+      <a
+        href={MASTER.vkWrite} target="_blank" rel="noreferrer"
+        className="mt-4 inline-flex items-center gap-2 rounded-full bg-[#0077FF] px-5 py-2.5 text-sm font-bold text-white shadow-md shadow-blue-200 transition active:scale-95"
+      >
+        💬 Написать во ВКонтакте
+      </a>
+      {MASTER.address && <p className="mt-3 text-xs text-stone-400">📍 {MASTER.address}</p>}
+    </header>
+  )
+}
+```
+
+**`src/components/ServicePicker.jsx`**
+
+```jsx
+import { rub, duration } from '../lib/format'
+
+export default function ServicePicker({ services, selectedId, onSelect }) {
+  return (
+    <div className="space-y-3">
+      {services.map((s) => {
+        const active = s.id === selectedId
+        return (
+          <button
+            key={s.id} onClick={() => onSelect(s)}
+            className={`w-full rounded-3xl border p-4 text-left transition active:scale-[.99] ${
+              active ? 'border-rose-400 bg-rose-50 ring-4 ring-rose-100' : 'border-rose-100 bg-white hover:border-rose-200'}`}
+          >
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <div className="font-bold text-stone-800">{s.title}</div>
+                <div className="mt-0.5 text-sm text-stone-400">⏱ {duration(s.duration_min)}</div>
+              </div>
+              <div className="text-right">
+                <div className="font-display text-lg text-rose-500">{rub(s.price_rub)}</div>
+                {active && <div className="text-xs font-bold text-rose-400">выбрано ✓</div>}
+              </div>
+            </div>
+          </button>
+        )
+      })}
+    </div>
+  )
+}
+```
+
+**`src/components/Calendar.jsx`**
+
+```jsx
+import { MONTHS, WEEKDAYS, dayStr } from '../lib/format'
+
+// month — Date на 1-е число; marks — Set дат 'YYYY-MM-DD' со свободными слотами.
+export default function Calendar({ month, setMonth, selected, marks, minDay, maxDay, onPick }) {
+  const y = month.getFullYear(), m = month.getMonth()
+  const offset = (new Date(y, m, 1).getDay() + 6) % 7 // неделя с понедельника
+  const daysInMonth = new Date(y, m + 1, 0).getDate()
+  const prevLast = new Date(y, m, 0)
+  const canPrev = dayStr(prevLast.getFullYear(), prevLast.getMonth(), prevLast.getDate()) >= minDay
+  const canNext = dayStr(y, m + 1 > 11 ? 0 : m + 1, 1) <= maxDay && new Date(y, m + 1, 1) <= new Date(maxDay)
+  const move = (n) => setMonth(new Date(y, m + n, 1))
+
+  return (
+    <div className="rounded-3xl border border-rose-100 bg-white p-4 shadow-sm shadow-rose-100">
+      <div className="mb-3 flex items-center justify-between">
+        <button onClick={() => move(-1)} disabled={!canPrev} aria-label="Предыдущий месяц"
+          className="h-10 w-10 rounded-xl text-2xl text-rose-400 disabled:text-stone-200">‹</button>
+        <div className="font-display text-lg text-stone-800">{MONTHS[m]} {y}</div>
+        <button onClick={() => move(1)} disabled={!canNext} aria-label="Следующий месяц"
+          className="h-10 w-10 rounded-xl text-2xl text-rose-400 disabled:text-stone-200">›</button>
+      </div>
+      <div className="grid grid-cols-7 gap-1 text-center">
+        {WEEKDAYS.map((w) => <div key={w} className="py-1 text-xs font-bold text-stone-300">{w}</div>)}
+        {Array.from({ length: offset }).map((_, i) => <div key={`b${i}`} />)}
+        {Array.from({ length: daysInMonth }).map((_, i) => {
+          const d = i + 1, ds = dayStr(y, m, d)
+          const disabled = ds < minDay || ds > maxDay
+          const has = marks.has(ds), sel = ds === selected
+          return (
+            <button
+              key={ds} disabled={disabled} onClick={() => onPick(ds)}
+              className={`relative h-11 rounded-xl text-sm font-semibold transition active:scale-95 ${
+                sel ? 'bg-rose-400 text-white shadow-md shadow-rose-200'
+                : disabled ? 'text-stone-200'
+                : has ? 'border border-rose-200 bg-rose-50 text-stone-700'
+                : 'text-stone-400'}`}
+            >
+              {d}
+              {has && !sel && <span className="absolute bottom-1 left-1/2 h-1 w-1 -translate-x-1/2 rounded-full bg-rose-400" />}
+            </button>
+          )
+        })}
+      </div>
+      <p className="mt-3 text-center text-xs text-stone-300">Дни с точкой — есть свободные окошки</p>
+    </div>
+  )
+}
+```
+
+**`src/components/SlotPicker.jsx`**
+
+```jsx
+import { hourLabel } from '../lib/format'
+import { Empty } from './ui'
+
+export default function SlotPicker({ slots, selectedId, onSelect }) {
+  if (!slots.length) {
+    return <Empty>На этот день свободных окошек нет 🌷<br />Попробуйте другую дату.</Empty>
+  }
+  return (
+    <div className="grid grid-cols-4 gap-2">
+      {slots.map((s) => (
+        <button
+          key={s.id} onClick={() => onSelect(s)}
+          className={`rounded-2xl py-3.5 text-base font-bold transition active:scale-95 ${
+            s.id === selectedId
+              ? 'bg-rose-400 text-white shadow-md shadow-rose-200'
+              : 'border border-rose-200 bg-white text-stone-700'}`}
+        >
+          {hourLabel(s.hour)}
+        </button>
+      ))}
+    </div>
+  )
+}
+```
+
+**`src/components/BookingForm.jsx`**
+
+```jsx
+import { useState } from 'react'
+import { fmtPhoneInput, phoneDigits } from '../lib/format'
+import { Btn, Field, Err, Spinner } from './ui'
+
+export default function BookingForm({ summary, busy, error, onSubmit }) {
+  const [name, setName] = useState('')
+  const [phone, setPhone] = useState('')
+  const [vk, setVk] = useState('')
+  const [localErr, setLocalErr] = useState('')
+
+  const submit = (e) => {
+    e.preventDefault()
+    if (name.trim().length < 2) return setLocalErr('Напишите, как вас зовут 🙂')
+    if (phoneDigits(phone).length !== 11) return setLocalErr('Введите номер телефона полностью.')
+    setLocalErr('')
+    onSubmit({ name: name.trim(), phone, vk: vk.trim() })
+  }
+
+  return (
+    <form onSubmit={submit} className="space-y-4 rounded-3xl border border-rose-100 bg-white p-5 shadow-sm shadow-rose-100">
+      <div className="rounded-2xl bg-rose-50 px-4 py-3 text-sm font-semibold text-rose-600">{summary}</div>
+      <Field label="Ваше имя" value={name} onChange={(e) => setName(e.target.value)} placeholder="Анна" autoComplete="name" />
+      <Field label="Телефон" type="tel" inputMode="tel" value={phone}
+        onChange={(e) => setPhone(fmtPhoneInput(e.target.value))} placeholder="+7 (900) 123-45-67" autoComplete="tel" />
+      <Field label="Ссылка на ВК" hint="— необязательно" value={vk}
+        onChange={(e) => setVk(e.target.value)} placeholder="vk.com/anna" inputMode="url" />
+      <Err>{localErr || error}</Err>
+      <Btn type="submit" disabled={busy} className="w-full">
+        {busy ? <span className="inline-flex items-center gap-2"><Spinner />Записываю…</span> : 'Записаться 💖'}
+      </Btn>
+      <p className="text-center text-[11px] leading-snug text-stone-300">
+        Нажимая кнопку, вы соглашаетесь на обработку персональных данных для оформления записи.
+      </p>
+    </form>
+  )
+}
+```
+
+**`src/components/Success.jsx`**
+
+```jsx
+import { MASTER } from '../config'
+import { fmtDay, hourLabel, rub, duration } from '../lib/format'
+import { Btn, Card } from './ui'
+
+const Row = ({ k, v }) => (
+  <div className="flex justify-between gap-4 border-b border-rose-50 py-2 last:border-0">
+    <span className="text-sm text-stone-400">{k}</span>
+    <span className="text-right font-semibold text-stone-700">{v}</span>
+  </div>
+)
+
+export default function Success({ booking: b, onReset }) {
+  const msg = `Здравствуйте! Я записалась 💖\n\nУслуга: ${b.service_title}\nДата: ${fmtDay(b.day)}\nВремя: ${hourLabel(b.hour)}\nДлительность: ${duration(b.duration_min)}\nСтоимость: ${rub(b.price_rub)}\nИмя: ${b.client_name}\nТелефон: ${b.phone}`
+  // Копируем текст в буфер и сразу открываем диалог ВК (vk.me не умеет предзаполнять текст)
+  const copy = () => { try { navigator.clipboard?.writeText(msg) } catch { /* не страшно */ } }
+
+  return (
+    <div className="pt-10 text-center">
+      <div className="mx-auto grid h-20 w-20 place-items-center rounded-full bg-rose-100 text-4xl">💌</div>
+      <h1 className="mt-4 font-display text-3xl text-stone-800">Вы записаны!</h1>
+      <p className="mt-2 text-sm text-stone-500">Мастер увидит запись и подтвердит её в личных сообщениях.</p>
+      <Card className="mt-6 text-left">
+        <Row k="Услуга" v={b.service_title} />
+        <Row k="Дата" v={fmtDay(b.day)} />
+        <Row k="Время" v={hourLabel(b.hour)} />
+        <Row k="Длительность" v={duration(b.duration_min)} />
+        <Row k="Стоимость" v={rub(b.price_rub)} />
+        <Row k="Имя" v={b.client_name} />
+        <Row k="Телефон" v={b.phone} />
+      </Card>
+      <a
+        href={MASTER.vkWrite} target="_blank" rel="noreferrer" onClick={copy}
+        className="mt-5 block w-full rounded-2xl bg-[#0077FF] px-5 py-4 text-base font-bold text-white shadow-lg shadow-blue-200 transition active:scale-[.97]"
+      >
+        💬 Отправить детали мастеру в ВК
+      </a>
+      <p className="mt-2 text-xs text-stone-400">Текст записи скопируется — просто вставьте его в чат.</p>
+      <Btn variant="soft" onClick={onReset} className="mt-6 w-full">Записаться ещё</Btn>
+    </div>
+  )
+}
+```
+
+**`src/pages/ClientPage.jsx`**
+
+```jsx
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { MASTER, BOOKING_DAYS_AHEAD } from '../config'
+import { listServices, listSlotsRange, bookSlot, humanError } from '../lib/api'
+import { todayStr, nowHour, shiftDay, parseDay, monthRange, fmtDay, hourLabel, rub } from '../lib/format'
+import Header from '../components/Header'
+import ServicePicker from '../components/ServicePicker'
+import Calendar from '../components/Calendar'
+import SlotPicker from '../components/SlotPicker'
+import BookingForm from '../components/BookingForm'
+import Success from '../components/Success'
+import { SectionTitle, Spinner, Err } from '../components/ui'
+
+export default function ClientPage() {
+  const today = todayStr()
+  const maxDay = shiftDay(today, BOOKING_DAYS_AHEAD)
+  const [services, setServices] = useState(null)
+  const [loadErr, setLoadErr] = useState('')
+  const [month, setMonth] = useState(() => { const t = parseDay(today); return new Date(t.getFullYear(), t.getMonth(), 1) })
+  const [slots, setSlots] = useState([])
+  const [reload, setReload] = useState(0)
+  const [service, setService] = useState(null)
+  const [day, setDay] = useState(null)
+  const [slot, setSlot] = useState(null)
+  const [busy, setBusy] = useState(false)
+  const [bookErr, setBookErr] = useState('')
+  const [done, setDone] = useState(null)
+  const calRef = useRef(null), formRef = useRef(null)
+
+  useEffect(() => {
+    listServices().then((s) => setServices(s.filter((x) => x.is_active))).catch((e) => setLoadErr(humanError(e)))
+  }, [])
+
+  useEffect(() => {
+    const { from, to } = monthRange(month)
+    listSlotsRange(from, to).then(setSlots).catch(() => setSlots([]))
+  }, [month, reload])
+
+  // Свободные слоты по дням; сегодняшние прошедшие часы скрываем
+  const freeByDay = useMemo(() => {
+    const map = new Map()
+    for (const s of slots) {
+      if (s.status !== 'free') continue
+      if (s.day < today || (s.day === today && s.hour <= nowHour())) continue
+      if (!map.has(s.day)) map.set(s.day, [])
+      map.get(s.day).push(s)
+    }
+    return map
+  }, [slots, today])
+
+  const scrollTo = (ref) => setTimeout(() => ref.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 50)
+  const pickService = (s) => { setService(s); scrollTo(calRef) }
+  const pickDay = (ds) => { setDay(ds); setSlot(null) }
+  const pickSlot = (s) => { setSlot(s); setBookErr(''); scrollTo(formRef) }
+
+  const submit = async (values) => {
+    setBusy(true); setBookErr('')
+    try {
+      const res = await bookSlot({ slotId: slot.id, serviceId: service.id, ...values })
+      setDone(res); window.scrollTo(0, 0)
+    } catch (e) {
+      setBookErr(humanError(e))
+      if ((e.message || '').includes('SLOT_TAKEN')) { setSlot(null); setReload((k) => k + 1) }
+    } finally { setBusy(false) }
+  }
+
+  const reset = () => {
+    setDone(null); setService(null); setDay(null); setSlot(null)
+    setReload((k) => k + 1); window.scrollTo(0, 0)
+  }
+
+  if (done) return <div className="mx-auto max-w-md px-4 pb-16"><Success booking={done} onReset={reset} /></div>
+
+  return (
+    <div className="mx-auto max-w-md px-4 pb-16">
+      <Header />
+      <Err>{loadErr}</Err>
+      <section className="mt-2">
+        <SectionTitle step="1">Выберите услугу</SectionTitle>
+        {services === null
+          ? <div className="flex justify-center py-8 text-rose-300"><Spinner /></div>
+          : <ServicePicker services={services} selectedId={service?.id} onSelect={pickService} />}
+      </section>
+
+      {service && (
+        <section ref={calRef} className="mt-8 scroll-mt-4">
+          <SectionTitle step="2">Дата и время</SectionTitle>
+          <Calendar month={month} setMonth={setMonth} selected={day}
+            marks={new Set(freeByDay.keys())} minDay={today} maxDay={maxDay} onPick={pickDay} />
+          {day && (
+            <div className="mt-4">
+              <p className="mb-2 text-sm font-bold capitalize text-stone-500">{fmtDay(day)}</p>
+              <SlotPicker slots={freeByDay.get(day) || []} selectedId={slot?.id} onSelect={pickSlot} />
+            </div>
+          )}
+        </section>
+      )}
+
+      {slot && service && (
+        <section ref={formRef} className="mt-8 scroll-mt-4">
+          <SectionTitle step="3">Ваши контакты</SectionTitle>
+          <BookingForm
+            summary={`${service.title} · ${fmtDay(day)}, ${hourLabel(slot.hour)} · ${rub(service.price_rub)}`}
+            busy={busy} error={bookErr} onSubmit={submit}
+          />
+        </section>
+      )}
+
+      <footer className="mt-12 text-center text-xs text-stone-300">
+        {MASTER.name} · запись открыта на {BOOKING_DAYS_AHEAD} дней вперёд
+      </footer>
+    </div>
+  )
+}
+```
+
+**`src/pages/admin/AdminPage.jsx`**
+
+```jsx
+import { useEffect, useState } from 'react'
+import { supabase, isConfigured } from '../../lib/supabase'
+import { signOutAdmin } from '../../lib/api'
+import { Spinner, Err } from '../../components/ui'
+import Login from './Login'
+import BookingsTab from './BookingsTab'
+import SlotsTab from './SlotsTab'
+import ServicesTab from './ServicesTab'
+
+const TABS = [
+  { id: 'bookings', icon: '📋', label: 'Записи' },
+  { id: 'slots', icon: '🕐', label: 'Окошки' },
+  { id: 'services', icon: '💅', label: 'Услуги' },
+]
+
+export default function AdminPage() {
+  const [session, setSession] = useState(undefined) // undefined = проверяем
+  const [tab, setTab] = useState('bookings')
+
+  useEffect(() => {
+    if (!isConfigured) return
+    supabase.auth.getSession().then(({ data }) => setSession(data.session))
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_e, s) => setSession(s))
+    return () => subscription.unsubscribe()
+  }, [])
+
+  if (!isConfigured) return <div className="mx-auto max-w-md p-6"><Err>Supabase не настроен: заполните ключи.</Err></div>
+  if (session === undefined) return <div className="flex justify-center pt-24 text-rose-300"><Spinner /></div>
+  if (!session) return <Login />
+
+  return (
+    <div className="mx-auto max-w-md px-4 pb-28 pt-6">
+      <div className="mb-5 flex items-center justify-between">
+        <h1 className="font-display text-2xl text-stone-800">Панель мастера</h1>
+        <button onClick={signOutAdmin} className="rounded-xl px-3 py-2 text-sm font-bold text-stone-400">Выйти</button>
+      </div>
+      {tab === 'bookings' && <BookingsTab />}
+      {tab === 'slots' && <SlotsTab />}
+      {tab === 'services' && <ServicesTab />}
+
+      <nav className="fixed inset-x-0 bottom-0 border-t border-rose-100 bg-white/95 pb-[env(safe-area-inset-bottom)] backdrop-blur">
+        <div className="mx-auto grid max-w-md grid-cols-3">
+          {TABS.map((t) => (
+            <button key={t.id} onClick={() => setTab(t.id)}
+              className={`flex flex-col items-center gap-0.5 py-3 text-xs font-bold ${tab === t.id ? 'text-rose-500' : 'text-stone-400'}`}>
+              <span className="text-2xl">{t.icon}</span>{t.label}
+            </button>
+          ))}
+        </div>
+      </nav>
+    </div>
+  )
+}
+```
+
+**`src/pages/admin/Login.jsx`**
+
+```jsx
+import { useState } from 'react'
+import { ADMIN_EMAIL } from '../../config'
+import { signInAdmin, humanError } from '../../lib/api'
+import { Btn, Card, Field, Err, Spinner } from '../../components/ui'
+
+export default function Login() {
+  const [pin, setPin] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState('')
+
+  const submit = async (e) => {
+    e.preventDefault()
+    setBusy(true); setErr('')
+    try { await signInAdmin(ADMIN_EMAIL, pin) }
+    catch (e2) { setErr(humanError(e2)) }
+    finally { setBusy(false) }
+  }
+
+  return (
+    <div className="mx-auto max-w-md px-4 pt-16">
+      <div className="mb-6 text-center">
+        <div className="text-5xl">🌷</div>
+        <h1 className="mt-3 font-display text-3xl text-stone-800">Панель мастера</h1>
+        <p className="mt-1 text-sm text-stone-400">Вход по пин-коду</p>
+      </div>
+      <Card>
+        <form onSubmit={submit} className="space-y-4">
+          <Field label="Пин-код" type="password" inputMode="numeric" autoComplete="current-password"
+            value={pin} onChange={(e) => setPin(e.target.value)} placeholder="••••••"
+            className="text-center text-2xl tracking-[.5em]" />
+          <Err>{err}</Err>
+          <Btn type="submit" disabled={busy || pin.length < 4} className="w-full">
+            {busy ? <span className="inline-flex items-center gap-2"><Spinner />Проверяю…</span> : 'Войти'}
+          </Btn>
+        </form>
+      </Card>
+    </div>
+  )
+}
+```
+
+**`src/pages/admin/BookingsTab.jsx`**
+
+```jsx
+import { useEffect, useState } from 'react'
+import { listBookings, cancelBooking, humanError } from '../../lib/api'
+import { fmtDay, hourLabel, rub, duration, todayStr, vkHref } from '../../lib/format'
+import { Btn, Card, Empty, Spinner, Err } from '../../components/ui'
+
+export default function BookingsTab() {
+  const [items, setItems] = useState(null)
+  const [err, setErr] = useState('')
+  const [reload, setReload] = useState(0)
+  const today = todayStr()
+
+  useEffect(() => {
+    listBookings()
+      .then((rows) => {
+        const flat = rows.map((b) => ({ ...b, day: b.slots.day, hour: b.slots.hour }))
+        flat.sort((a, b) =>
+          (a.day + String(a.hour).padStart(2, '0')).localeCompare(b.day + String(b.hour).padStart(2, '0')))
+        setItems(flat)
+      })
+      .catch((e) => { setErr(humanError(e)); setItems([]) })
+  }, [reload])
+
+  const cancel = async (b) => {
+    if (!window.confirm(`Отменить запись «${b.client_name}»? Окошко снова станет свободным.`)) return
+    try { await cancelBooking(b.id); setReload((k) => k + 1) }
+    catch (e) { alert(humanError(e)) }
+  }
+
+  if (items === null) return <div className="flex justify-center py-10 text-rose-300"><Spinner /></div>
+  const days = [...new Set(items.map((b) => b.day))]
+
+  return (
+    <div>
+      <div className="mb-3 flex items-center justify-between">
+        <p className="text-sm font-bold text-stone-400">Активных: {items.length}</p>
+        <Btn variant="ghost" className="px-4 py-2 text-sm" onClick={() => setReload((k) => k + 1)}>↻ Обновить</Btn>
+      </div>
+      <Err>{err}</Err>
+      {!items.length && <Empty>Записей пока нет 🌷<br />Откройте окошки во вкладке «Окошки».</Empty>}
+      {days.map((day) => (
+        <div key={day}>
+          <h3 className="mb-2 mt-5 font-display text-lg capitalize text-stone-700">
+            {fmtDay(day)} {day < today && <span className="font-sans text-xs font-normal text-stone-300">· прошла</span>}
+          </h3>
+          <div className="space-y-3">
+            {items.filter((b) => b.day === day).map((b) => (
+              <Card key={b.id} className={day < today ? 'opacity-60' : ''}>
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <div className="text-lg font-extrabold text-stone-800">{hourLabel(b.hour)} · {b.client_name}</div>
+                    <div className="mt-0.5 text-sm text-stone-500">{b.service_title} · {rub(b.price_rub)} · {duration(b.duration_min)}</div>
+                    <div className="mt-2 flex flex-wrap gap-3 text-sm font-bold">
+                      <a href={`tel:${b.phone}`} className="text-rose-500">📞 {b.phone}</a>
+                      {b.vk_link && <a href={vkHref(b.vk_link)} target="_blank" rel="noreferrer" className="text-[#0077FF]">💬 ВК</a>}
+                    </div>
+                  </div>
+                  <Btn variant="danger" className="shrink-0 px-3 py-2 text-sm" onClick={() => cancel(b)}>Отменить</Btn>
+                </div>
+              </Card>
+            ))}
+          </div>
+        </div>
+      ))}
+    </div>
+  )
+}
+```
+
+**`src/pages/admin/SlotsTab.jsx`**
+
+```jsx
+import { useEffect, useState } from 'react'
+import { WORK_HOURS } from '../../config'
+import { listSlotsRange, addSlot, removeSlot, humanError } from '../../lib/api'
+import { todayStr, hourLabel } from '../../lib/format'
+import { Spinner, Err } from '../../components/ui'
+
+export default function SlotsTab() {
+  const [day, setDay] = useState(todayStr())
+  const [slots, setSlots] = useState(null)
+  const [busyHour, setBusyHour] = useState(null)
+  const [err, setErr] = useState('')
+  const [reload, setReload] = useState(0)
+
+  useEffect(() => {
+    setSlots(null)
+    listSlotsRange(day, day).then(setSlots).catch((e) => { setErr(humanError(e)); setSlots([]) })
+  }, [day, reload])
+
+  const byHour = new Map((slots || []).map((s) => [s.hour, s]))
+  const tap = async (hour) => {
+    const s = byHour.get(hour)
+    if (s?.status === 'booked') return
+    setBusyHour(hour); setErr('')
+    try {
+      if (s) await removeSlot(s.id)
+      else await addSlot(day, hour)
+      setReload((k) => k + 1)
+    } catch (e) { setErr(humanError(e)) }
+    finally { setBusyHour(null) }
+  }
+
+  const free = (slots || []).filter((s) => s.status === 'free').length
+  const booked = (slots || []).filter((s) => s.status === 'booked').length
+
+  return (
+    <div>
+      <input type="date" value={day} min={todayStr()}
+        onChange={(e) => e.target.value && setDay(e.target.value)}
+        className="w-full rounded-2xl border border-rose-200 bg-white px-4 py-3.5 text-lg font-bold text-stone-800 outline-none focus:border-rose-400" />
+      {slots === null ? <div className="flex justify-center py-10 text-rose-300"><Spinner /></div> : (
+        <>
+          <p className="mt-3 text-sm font-bold text-stone-400">Свободно: {free} · Занято: {booked}</p>
+          <div className="mt-3 grid grid-cols-3 gap-2">
+            {WORK_HOURS.map((h) => {
+              const s = byHour.get(h)
+              const isBooked = s?.status === 'booked'
+              const isFree = Boolean(s) && !isBooked
+              return (
+                <button key={h} disabled={isBooked || busyHour === h} onClick={() => tap(h)}
+                  className={`rounded-2xl py-4 text-lg font-bold transition active:scale-95 disabled:active:scale-100 ${
+                    isBooked ? 'bg-stone-100 text-stone-400'
+                    : isFree ? 'bg-rose-400 text-white shadow-md shadow-rose-200'
+                    : 'border-2 border-dashed border-rose-200 bg-white text-stone-400'}`}>
+                  {isBooked ? '🔒 ' : isFree ? '✓ ' : '+ '}{hourLabel(h)}
+                </button>
+              )
+            })}
+          </div>
+          <div className="mt-3"><Err>{err}</Err></div>
+          <p className="mt-4 text-sm leading-relaxed text-stone-400">
+            Тап по «+» — открыть окошко. Тап по розовому — закрыть его.
+            🔒 — час занят записью; он освободится после отмены во вкладке «Записи».
+          </p>
+        </>
+      )}
+    </div>
+  )
+}
+```
+
+**`src/pages/admin/ServicesTab.jsx`**
+
+```jsx
+import { useEffect, useState } from 'react'
+import { listServices, saveService, humanError } from '../../lib/api'
+import { rub, duration } from '../../lib/format'
+import { Btn, Card, Field, Empty, Spinner, Err } from '../../components/ui'
+
+const blank = { id: null, title: '', price_rub: '', duration_min: 120, is_active: true }
+
+function Editor({ draft, onDone }) {
+  const [s, setS] = useState(draft)
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState('')
+  const set = (k, v) => setS((p) => ({ ...p, [k]: v }))
+
+  const save = async () => {
+    if (!s.title.trim()) return setErr('Введите название.')
+    if (!(Number(s.price_rub) >= 0) || !(Number(s.duration_min) > 0)) return setErr('Цена и длительность должны быть числами.')
+    setBusy(true); setErr('')
+    try { await saveService(s); onDone(true) }
+    catch (e) { setErr(humanError(e)) }
+    finally { setBusy(false) }
+  }
+
+  return (
+    <Card className="space-y-3 border-rose-300">
+      <Field label="Название" value={s.title} onChange={(e) => set('title', e.target.value)} placeholder="Объём 2D" />
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="Цена, ₽" inputMode="numeric" value={s.price_rub}
+          onChange={(e) => set('price_rub', e.target.value.replace(/\D/g, ''))} />
+        <Field label="Длительность, мин" inputMode="numeric" value={s.duration_min}
+          onChange={(e) => set('duration_min', e.target.value.replace(/\D/g, ''))} />
+      </div>
+      <label className="flex items-center gap-3 text-sm font-semibold text-stone-600">
+        <input type="checkbox" checked={s.is_active} onChange={(e) => set('is_active', e.target.checked)} className="h-5 w-5 accent-rose-400" />
+        Показывать клиентам
+      </label>
+      <Err>{err}</Err>
+      <div className="flex gap-2">
+        <Btn className="flex-1" disabled={busy} onClick={save}>{busy ? 'Сохраняю…' : 'Сохранить'}</Btn>
+        <Btn variant="ghost" onClick={() => onDone(false)}>Отмена</Btn>
+      </div>
+    </Card>
+  )
+}
+
+export default function ServicesTab() {
+  const [items, setItems] = useState(null)
+  const [editingId, setEditingId] = useState(null) // id услуги | 'new' | null
+  const [err, setErr] = useState('')
+  const [reload, setReload] = useState(0)
+
+  useEffect(() => {
+    listServices().then(setItems).catch((e) => { setErr(humanError(e)); setItems([]) })
+  }, [reload])
+
+  const done = (saved) => { setEditingId(null); if (saved) setReload((k) => k + 1) }
+
+  if (items === null) return <div className="flex justify-center py-10 text-rose-300"><Spinner /></div>
+  return (
+    <div className="space-y-3">
+      <Err>{err}</Err>
+      {editingId !== 'new' && <Btn variant="soft" className="w-full" onClick={() => setEditingId('new')}>＋ Добавить услугу</Btn>}
+      {editingId === 'new' && <Editor draft={blank} onDone={done} />}
+      {!items.length && editingId !== 'new' && <Empty>Добавьте первую услугу 💅</Empty>}
+      {items.map((s) => editingId === s.id
+        ? <Editor key={s.id} draft={s} onDone={done} />
+        : (
+          <Card key={s.id} className="flex items-center justify-between gap-3">
+            <div>
+              <div className="font-bold text-stone-800">
+                {s.title}
+                {!s.is_active && <span className="ml-1 rounded-full bg-stone-100 px-2 py-0.5 text-xs font-semibold text-stone-400">скрыта</span>}
+              </div>
+              <div className="mt-0.5 text-sm text-stone-500">{rub(s.price_rub)} · {duration(s.duration_min)}</div>
+            </div>
+            <Btn variant="ghost" className="shrink-0 px-4 py-2 text-sm" onClick={() => setEditingId(s.id)}>Изменить</Btn>
+          </Card>
+        ))}
+      <p className="pt-2 text-xs leading-relaxed text-stone-300">
+        Удаление не предусмотрено: скрывайте услугу галочкой — история записей останется целой.
+      </p>
+    </div>
+  )
+}
+```
+
+---
+
+## Шаг 6. Деплой на GitHub Pages
+
+**`.github/workflows/deploy.yml`**
+
+```yaml
+name: Deploy to GitHub Pages
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+concurrency:
+  group: pages
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+        env:
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
+```
+
+Free-проект Supabase засыпает после недели без запросов [[29]], поэтому добавляем «будильник» (запросы к БД считаются активностью):
+
+**`.github/workflows/keepalive.yml`**
+
+```yaml
+name: Keep Supabase awake
+on:
+  schedule:
+    - cron: "0 6 * * 1,4"   # понедельник и четверг, 06:00 UTC
+  workflow_dispatch:
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Supabase REST
+        run: |
+          curl -sf "${{ secrets.VITE_SUPABASE_URL }}/rest/v1/services?select=id&limit=1" \
+            -H "apikey: ${{ secrets.VITE_SUPABASE_ANON_KEY }}"
+```
+
+**Запуск:**
+1. Локально: `npm install` → появится `package-lock.json` (его **обязательно** коммитим — `npm ci` в workflow без него упадёт).
+2. Проверка: скопируйте `.env.example` в `.env`, вставьте URL и anon-ключ из **Supabase → Project Settings → API**, затем `npm run dev`.
+3. Создайте репозиторий `lash-booking`, запушьте весь проект в `main`.
+4. GitHub → **Settings → Secrets and variables → Actions** → секреты `VITE_SUPABASE_URL` и `VITE_SUPABASE_ANON_KEY`.
+5. **Settings → Pages → Build and deployment → Source: GitHub Actions**. Пуш → вкладка Actions → через ~1–2 минуты сайт жив.
+6. В ВК: **Управление сообществом → Меню / Кнопка действия** → ссылка «Онлайн-запись 💖» на сайт + закреплённый пост. Трафик из мобильного браузера ВК работает без нюансов — сайт полностью статический, без cookie-авторизации на клиентской части.
+
+**`README.md`** (шпаргалка для доработки локальной нейросетью)
+
+```markdown
+# lash-booking
+Запись к lash-мастеру. Vite + React + Tailwind v4 + Supabase. Хостинг: GitHub Pages.
+
+Адреса: / — клиенты, /#/admin — мастер (пин = пароль пользователя Supabase Auth).
+Безопасность: RLS в supabase/schema.sql; клиент пишет только через RPC book_slot.
+
+Какие файлы давать нейросети (контекст 16k):
+- Поменять тексты/цены/часы/ссылки: src/config.js (+ supabase/schema.sql для услуг)
+- Дизайн кнопок/карточек: src/components/ui.jsx + src/index.css
+- Логика записи клиента: src/pages/ClientPage.jsx + src/lib/api.js
+- Календарь: src/components/Calendar.jsx + src/lib/format.js
+- Админка: src/pages/admin/AdminPage.jsx + нужная вкладка + src/lib/api.js
+- Уведомления ВК: supabase/functions/notify-vk/index.ts
+Команды: npm run dev / npm run build. Деплой: push в main.
+```
+
+---
+
+## Честные ограничения и чек-лист
+
+- **Спам/злоупотребления:** anon-ключ публичный, и теоретически скрипт может занимать окошки. RPC валидирует имя/телефон, мастер отменяет фейки в один тап. Если появится спам — следующий шаг: бесплатная Yandex SmartCaptcha перед `book_slot`.
+- **Не включайте регистрацию в Auth** и не кладите `service_role`/`VK_TOKEN` во фронтенд — они только в секретах Edge Function.
+- **Пин-код** — минимум 6 цифр; Supabase сам ограничивает частоту попыток входа.
+- **GitHub отключает cron-расписания** после ~60 дней без коммитов в репозитории — если сайт «замолчал», сделайте любой коммит или запустите keepalive вручную (workflow_dispatch).
+- Часы — целые (`WORK_HOURS`), часовой пояс мастера — `TIMEZONE` в `config.js`; прошедшие сегодняшние часы клиенту не показываются.
+
+**Финальный тест:** откройте сайт с телефона → запись → мастеру прилетает сообщение в ВК → в `/#/admin` запись видна → «Отменить» → окошко снова свободно на сайте. Если сообщение не пришло — смотрите логи Edge Function: ошибка `901` означает, что мастер ещё не написал сообществу первым [[6]].
